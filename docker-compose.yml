@@ -1,0 +1,147 @@
+# ==============================================================
+# docker-compose.yml — Star Light Path
+# Base configuration (shared by dev and prod overrides)
+# Usage:
+#   Development:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#   Production:   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ==============================================================
+
+version: "3.9"
+
+# ─── Networks ─────────────────────────────────────────────────
+networks:
+  starlightpath_net:
+    driver: bridge
+    name: starlightpath_net
+
+# ─── Volumes ──────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    name: starlightpath_postgres_data
+  redis_data:
+    name: starlightpath_redis_data
+  media_files:
+    name: starlightpath_media_files
+  static_files:
+    name: starlightpath_static_files
+
+# ─── Services ─────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL Database ──────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: starlightpath_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-starlightpath}
+      POSTGRES_USER: ${POSTGRES_USER:-slpuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - starlightpath_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slpuser} -d ${POSTGRES_DB:-starlightpath}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Redis Cache ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: starlightpath_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redispassword}
+    volumes:
+      - redis_data:/data
+    networks:
+      - starlightpath_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispassword}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Django Backend ────────────────────────────────────────────
+  backend:
+    container_name: starlightpath_backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override specific vars for Docker networking
+      DB_ENGINE: django.db.backends.postgresql
+      DB_HOST: db
+      DB_PORT: "5432"
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/1
+    volumes:
+      - media_files:/app/media
+      - static_files:/app/staticfiles
+    networks:
+      - starlightpath_net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/schema/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Next.js Frontend ──────────────────────────────────────────
+  frontend:
+    container_name: starlightpath_frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    networks:
+      - starlightpath_net
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: starlightpath_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - static_files:/app/staticfiles:ro
+      - media_files:/app/media:ro
+      # SSL certificates (mounted in production)
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks:
+      - starlightpath_net
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
